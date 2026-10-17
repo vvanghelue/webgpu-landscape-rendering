@@ -1,0 +1,5 @@
+html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: ui-monospace, Menlo, monospace; }
+canvas { display: block; }
+#loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: #ddd; font-size: 18px; background: #0b1016; z-index: 10; white-space: pre; text-align: center; }
+#hud { position: fixed; top: 8px; left: 8px; color: #fff; font-size: 12px; line-height: 1.45; background: rgba(0,0,0,.45); padding: 6px 9px; border-radius: 4px; pointer-events: none; white-space: pre; }
+#help { position: fixed; bottom: 8px; left: 8px; color: #fff; font-size: 11px; background: rgba(0,0,0,.4); padding: 4px 8px; border-radius: 4px; pointer-events: none; }
