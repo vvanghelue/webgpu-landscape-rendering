@@ -227,8 +227,11 @@ export class Trees {
 		} )().compute( 1 );
 
 		// Append a record to the per-species instance list; the counter doubles as the indirect instanceCount.
-		const append = ( args, lists, isBroad, rec, isFar = null ) => {
+		const append = ( args, lists, isBroad, record, isFar = null ) => {
 
+			// Assign the record before branching: TSL caches a node reused across sibling If branches into a var that is
+			// only assigned in the first branch, so the other branches would write zeros.
+			const rec = record.toVar();
 			const emit = ( species ) => {
 
 				const slot = atomicAdd( args[ species ].counter, uint( 1 ) ).toVar();
