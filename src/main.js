@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import GUI from 'lil-gui';
+import Stats from 'three/addons/libs/stats.module.js';
 import * as TSL from 'three/tsl';
 import { World } from './world/World.js';
 import { Terrain } from './terrain/Terrain.js';
@@ -9,7 +10,7 @@ import { Water } from './water/Water.js';
 import { Sky } from './sky/Sky.js';
 import { FlyControls } from './controls/FlyControls.js';
 import {
-	initShading, sunDir, fogDensity, nearTreeRadius, treeDrawDistance, treeTierRange0, treeShadowDistance,
+	initShading, sunDir, fogDensity, nearTreeRadius, treeCrossfade, treeDrawDistance, treeTierRange0, treeShadowDistance,
 } from './shading/common.js';
 import { TREE_CELL, WORLD_SIZE } from './world/config.js';
 
@@ -108,6 +109,7 @@ async function main() {
 		nearTrees: true,
 		farTrees: true,
 		nearRadius: nearTreeRadius.value,
+		crossfade: treeCrossfade.value,
 		tierRange: treeTierRange0.value,
 		treeDistance: treeDrawDistance.value,
 		treeShadowDistance: treeShadowDistance.value,
@@ -140,6 +142,7 @@ async function main() {
 	fTr.add( settings, 'nearTrees' ).name( 'mesh trees' ).onChange( ( v ) => trees.enabledNear = v );
 	fTr.add( settings, 'farTrees' ).name( 'impostors' ).onChange( ( v ) => trees.enabledFar = v );
 	fTr.add( settings, 'nearRadius', 40, 300, 5 ).name( 'mesh radius (m)' ).onChange( ( v ) => nearTreeRadius.value = v );
+	fTr.add( settings, 'crossfade', 0, 200, 5 ).name( 'mesh/card crossfade (m)' ).onChange( ( v ) => treeCrossfade.value = v );
 	fTr.add( settings, 'tierRange', 500, 6000, 50 ).name( 'full density to (m)' ).onChange( ( v ) => treeTierRange0.value = v );
 	fTr.add( settings, 'treeDistance', 1000, 20000, 100 ).name( 'draw distance (m)' ).onChange( ( v ) => treeDrawDistance.value = v );
 	fTr.add( settings, 'treeShadowDistance', 0, 4000, 50 ).name( 'tree shadow dist (m)' ).onChange( ( v ) => treeShadowDistance.value = v );
@@ -157,11 +160,20 @@ async function main() {
 
 	loading.remove();
 
+	// stats.js graphs side by side: FPS, CPU ms (JS time per frame), GPU ms (timestamp queries).
+	const panels = { fps: new Stats.Panel( 'FPS', '#0ff', '#002' ), cpu: new Stats.Panel( 'CPU', '#0f0', '#020' ), gpu: new Stats.Panel( 'GPU', '#ff0', '#220' ) };
+	const statsBar = document.createElement( 'div' );
+	statsBar.id = 'stats';
+	for ( const p of Object.values( panels ) ) statsBar.appendChild( p.dom );
+	document.body.appendChild( statsBar );
+	let fpsFrames = 0, fpsStart = performance.now();
+
 	const clock = new THREE.Timer();
 	let frames = 0, acc = 0, fps = 0, ms = 0, hudTimer = 0, gpuMs = 0, gpuPending = false;
 
 	renderer.setAnimationLoop( () => {
 
+		const cpuStart = performance.now();
 		clock.update();
 		const dt = Math.min( clock.getDelta(), 0.1 );
 
@@ -185,7 +197,13 @@ async function main() {
 			gpuPending = true;
 			renderer.resolveTimestampsAsync( 'render' ).then( ( d ) => {
 
-				if ( d ) gpuMs = gpuMs * 0.9 + d * 0.1;
+				if ( d ) {
+
+					gpuMs = gpuMs * 0.9 + d * 0.1;
+					panels.gpu.update( d, 33 );
+
+				}
+
 				gpuPending = false;
 
 			} );
@@ -202,16 +220,27 @@ async function main() {
 				`direct tris    ${ ( info.triangles / 1e6 ).toFixed( 2 ) } M (+ indirect trees)`,
 				`terrain patches ${ terrain.stats.patches }`,
 				`tree tiles     ${ trees.stats.tiles }  (${ ( trees.stats.cells / 1e6 ).toFixed( 2 ) } M cells culled on GPU)`,
-				`visible trees  ${ ( trees.stats.visibleImpostors / 1e6 ).toFixed( 3 ) } M impostors + ${ trees.stats.visibleMeshes } meshes`,
+				`visible trees  ${ ( trees.stats.visibleImpostors / 1e6 ).toFixed( 3 ) } M impostors + ${ trees.stats.visibleMeshes } meshes (${ trees.stats.crossfading } crossfading)`,
 				`trees on map   ~${ ( world.expectedTrees / 1e6 ).toFixed( 2 ) } M (${ TREE_CELL } m grid)`,
 				`camera         ${ camera.position.x.toFixed( 0 ) }, ${ camera.position.y.toFixed( 0 ) }, ${ camera.position.z.toFixed( 0 ) }  speed ${ controls.speed.toFixed( 0 ) } m/s`,
 			].join( '\n' );
 
 		}
 
+		const now = performance.now();
+		panels.cpu.update( now - cpuStart, 33 );
+		fpsFrames ++;
+		if ( now >= fpsStart + 1000 ) {
+
+			panels.fps.update( ( fpsFrames * 1000 ) / ( now - fpsStart ), 100 );
+			fpsStart = now;
+			fpsFrames = 0;
+
+		}
+
 	} );
 
-	window.__app = { THREE, TSL, uniforms: { treeShadowDistance, fogDensity, treeTierRange0, nearTreeRadius }, renderer, scene, camera, world, terrain, trees, shadows, controls, views, settings, updateSun };
+	window.__app = { THREE, TSL, uniforms: { treeShadowDistance, fogDensity, treeTierRange0, nearTreeRadius, treeCrossfade }, renderer, scene, camera, world, terrain, trees, shadows, controls, views, settings, updateSun };
 
 }
 

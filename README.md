@@ -22,7 +22,7 @@ Click to fly · WASD · Q/E down/up · Shift ×6 boost · mouse wheel = speed. U
 | Long-range shadows | GPU compute pass ray-marches the heightmap toward the sun (100 steps, geometric step growth up to ~6 km) and writes soft visibility + large-scale AO to a 2048² texture. Rebaked only when the sun moves. Mountains shadow terrain, trees and water **at any distance**. | `src/terrain/ShadowBaker.js` |
 | Trees: placement | No per-tree CPU data. A tree is a pure function of its 4 m grid cell (hash + density texture), so every system agrees where trees are. | `src/shading/common.js` (`treeAt`) |
 | Trees: GPU culling | Each frame: a CPU quadtree picks 32×32-cell tiles by tier. A compute pass evaluates every cell, applies distance fades and a sphere-frustum test, then **atomically appends** survivors to compact instance buffers. The atomic counters are the **indirect draw args** (`drawIndexedIndirect`). | `src/vegetation/Trees.js` |
-| Trees: LOD | < 180 m: low-poly meshes (2 species). 180–600 m: opaque silhouette cards with fake volumetric normals. > 600 m: 1-triangle cards. Each tier beyond `full density` visits every 2nd cell per axis, and trees that disappear in the next tier shrink smoothly first, so there is no popping. Far away, forests also tint the terrain. | `src/vegetation/Trees.js` |
+| Trees: LOD | < 180 m: low-poly meshes (2 species). 180–600 m: opaque silhouette cards with fake volumetric normals. > 600 m: 1-triangle cards. Each tier beyond `full density` visits every 2nd cell per axis, and trees that disappear in the next tier shrink smoothly first, so there is no popping. Meshes and cards **crossfade with real alpha blending** over a 100 m band (130–230 m): the mesh fades in over the opaque card, then the card fades out over the opaque mesh, so nothing ever shows through and there is no dither noise. Far away, forests also tint the terrain. | `src/vegetation/Trees.js` |
 | Tree shadows | **Procedural, no shadow map**: the terrain shader ray-sphere-tests the canopies of the cells where the sun ray crosses canopy height. Self-shadowing on mesh trees uses the same function. Beyond ~1 km this becomes statistical darkening from forest density. | `src/shading/common.js` |
 | Water | Opaque. Depth from the heightmap: absorption, shore foam, sand showing through. Analytic waves that fade out per wavelength (no moiré), Fresnel sky reflection with sun glint. Mountains shadow it via the baked texture. | `src/water/Water.js` |
 | Atmosphere | Analytic height fog integrated along the view ray, coloured by the same `skyColor()` as the sky dome and the reflections, so the horizon is seamless. | `src/shading/common.js` |
@@ -45,7 +45,7 @@ Tools: `node scripts/screenshot.mjs [url] [views]` (headless Chrome, prints HUD 
 
 ## Next iterations (ideas)
 
-- Real octahedral impostors baked from the tree meshes (texture atlas), plus a crossfade between meshes and impostors.
+- Real octahedral impostors baked from the tree meshes (texture atlas), so the mesh/card crossfade blends matching silhouettes.
 - Hi-Z occlusion culling of tree tiles/instances (mountains hide most of the forest at low altitude).
 - Terrain: higher-frequency detail (procedural or tiled detail heightmaps), texture splatting, triplanar rock.
 - Cascaded shadow map for near (<100 m) mesh trees, combined with the baked far shadows.

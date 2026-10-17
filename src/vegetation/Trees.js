@@ -1,13 +1,13 @@
 import * as THREE from 'three/webgpu';
 import {
-	Fn, If, attribute, positionLocal, positionWorld, normalLocal, cameraPosition, instanceIndex, varyingProperty, uniform,
+	Fn, If, attribute, positionLocal, positionWorld, normalLocal, cameraPosition, instanceIndex, vertexIndex, varyingProperty, uniform,
 	vec2, vec3, vec4, float, uint, abs, mod, floor, fract, max, mix, step, select, sqrt, sin, cos, atan, exp2, length,
 	normalize, smoothstep, clamp, dot, instancedArray, storage, atomicAdd, atomicStore,
 } from 'three/tsl';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
 	treeAt, treeIsBroadleaf, heightAt, shadowAt, shade, applyFog, fogParams, hash22, proceduralTreeShadow, ss,
-	nearTreeRadius, treeDrawDistance, treeTierRange0, impostorFarDistance,
+	nearTreeRadius, treeCrossfade, crossfadeIn, crossfadeOut, treeDrawDistance, treeTierRange0, impostorFarDistance,
 } from '../shading/common.js';
 import { WORLD_SIZE, TREE_CELL } from '../world/config.js';
 
@@ -21,12 +21,19 @@ import { WORLD_SIZE, TREE_CELL } from '../world/config.js';
 //   3. Indirect draws: impostor quads (far) and two low-poly mesh species (near).
 // Each tier further away visits every 2nd cell per axis; trees that vanish in the next tier are shrunk smoothly before
 // the switch, so there is no popping.
+//
+// Mesh <-> impostor is a real alpha crossfade across a wide band around nearTreeRadius, and one of the two is always
+// opaque so the terrain never shows through a half-faded tree:
+//   crossfadeIn .. nearTreeRadius   opaque mesh, card fading out on top of it
+//   nearTreeRadius .. crossfadeOut  opaque card, mesh fading in on top of it
+// No dither or noise, so the transition is just as smooth while moving as when standing still.
 
 const TILE = 32; // cells per tile side
 const TIERS = 5;
 const MAX_TILES = 4096;
 const MAX_IMPOSTORS = 2_000_000;
 const MAX_NEAR = 32768;
+const MAX_FADE = 16384;
 
 const vUv = varyingProperty( 'vec2', 'vTreeUv' );
 const vInfo = varyingProperty( 'vec4', 'vTreeInfo' ); // x: broadleaf, y: rnd, z: sun visibility, w: ao
@@ -35,6 +42,7 @@ const vToCam = varyingProperty( 'vec3', 'vTreeToCam' );
 const vNormal = varyingProperty( 'vec3', 'vTreeNormal' );
 const vLocalY = varyingProperty( 'float', 'vTreeLocalY' );
 const vFog = varyingProperty( 'vec4', 'vTreeFog' );
+const vFade = varyingProperty( 'float', 'vTreeFade' );
 
 // Instance record: vec4( x, groundY, z, floor(height * 100) + rnd )
 const pack = ( H, rnd ) => floor( H.mul( 100.0 ) ).add( rnd.mul( 0.999 ) );
@@ -133,7 +141,7 @@ function cardGeometry( pos, idx ) {
 
 // All indirect draw args live in ONE buffer (5 uints per draw, offset per draw) to stay under the
 // 8-storage-buffers-per-stage limit in the cull passes. instanceCount (word 1) is the atomic append counter.
-const MAX_DRAWS = 6;
+const MAX_DRAWS = 10;
 const drawArgsAttr = new THREE.IndirectStorageBufferAttribute( new Uint32Array( MAX_DRAWS * 5 ), 1 );
 const drawArgsNode = storage( drawArgsAttr, 'uint', MAX_DRAWS * 5 ).toAtomic();
 let drawSlots = 0;
@@ -159,7 +167,7 @@ export class Trees {
 		this._box = new THREE.Box3();
 		this._range = { min: 0, max: 0 };
 		this._pv = new THREE.Matrix4();
-		this.stats = { tiles: 0, cells: 0, nearCells: 0, visibleImpostors: 0, visibleMeshes: 0 };
+		this.stats = { tiles: 0, cells: 0, nearCells: 0, visibleImpostors: 0, visibleMeshes: 0, crossfading: 0 };
 		this.enabledNear = true;
 		this.enabledFar = true;
 
@@ -173,6 +181,8 @@ export class Trees {
 		// lists: [ conifer near, broadleaf near, conifer far, broadleaf far ]
 		this.impostorInstances = [ 0.3, 0.15, 0.7, 0.3 ].map( ( f ) => instancedArray( MAX_IMPOSTORS * f, 'vec4' ) );
 		this.nearInstances = [ instancedArray( MAX_NEAR, 'vec4' ), instancedArray( MAX_NEAR, 'vec4' ) ];
+		this.meshFadeInstances = [ instancedArray( MAX_FADE, 'vec4' ), instancedArray( MAX_FADE, 'vec4' ) ];
+		this.cardFadeInstances = [ instancedArray( MAX_FADE, 'vec4' ), instancedArray( MAX_FADE, 'vec4' ) ];
 
 		// --- impostors: one opaque card draw per species, drawn indirectly
 		this.impostorArgs = [];
@@ -182,7 +192,7 @@ export class Trees {
 			const species = list & 1;
 
 			this.impostorArgs.push( indirectArgs( geo, geo.index.count ) );
-			const mesh = new THREE.Mesh( geo, this.createImpostorMaterial( species, list ) );
+			const mesh = new THREE.Mesh( geo, this.createImpostorMaterial( species, this.impostorInstances[ list ] ) );
 			mesh.frustumCulled = false;
 			this.group.add( mesh );
 			return mesh;
@@ -195,14 +205,57 @@ export class Trees {
 
 			const geo = new THREE.InstancedBufferGeometry().copy( src );
 			this.nearArgs.push( indirectArgs( geo, src.attributes.position.count ) );
-			const mesh = new THREE.Mesh( geo, this.createMeshMaterial( species ) );
+			const mesh = new THREE.Mesh( geo, this.createMeshMaterial( species, this.nearInstances[ species ] ) );
 			mesh.frustumCulled = false;
 			this.group.add( mesh );
 			return mesh;
 
 		} );
 
+		// --- crossfade band, drawn after all opaque geometry (transparent queue, in this renderOrder)
+		// Fading meshes: a depth-only pass first, so the blended pass only shades each tree's front-most surface
+		// (otherwise its overlapping cones/blobs would show through each other).
+		this.meshFadeArgs = [];
+		this.fadeMeshes = [ createConiferGeometry(), createBroadleafGeometry() ].flatMap( ( src, species ) => {
+
+			const geo = new THREE.InstancedBufferGeometry().copy( src );
+			this.meshFadeArgs.push( indirectArgs( geo, src.attributes.position.count ) );
+			const color = this.createMeshMaterial( species, this.meshFadeInstances[ species ], true );
+			// Same node graph -> identical vertex shader, so the LessEqual test in the colour pass hits the prepass depth exactly.
+			const depth = color.clone();
+			depth.colorWrite = false;
+			depth.depthWrite = true;
+			return [ [ depth, 4 ], [ color, 5 ] ].map( ( [ mat, order ] ) => {
+
+				const mesh = new THREE.Mesh( geo, mat );
+				mesh.frustumCulled = false;
+				mesh.renderOrder = order;
+				this.group.add( mesh );
+				return mesh;
+
+			} );
+
+		} );
+
+		this.cardFadeArgs = [];
+		this.fadeCards = [ createConiferCardGeometry(), createBroadleafCardGeometry() ].map( ( geo, species ) => {
+
+			this.cardFadeArgs.push( indirectArgs( geo, geo.index.count ) );
+			const mesh = new THREE.Mesh( geo, this.createImpostorMaterial( species, this.cardFadeInstances[ species ], true ) );
+			mesh.frustumCulled = false;
+			mesh.renderOrder = 6;
+			this.group.add( mesh );
+			return mesh;
+
+		} );
+
 		this.createComputePasses();
+
+	}
+
+	allArgs() {
+
+		return [ ...this.impostorArgs, ...this.nearArgs, ...this.meshFadeArgs, ...this.cardFadeArgs ];
 
 	}
 
@@ -219,7 +272,7 @@ export class Trees {
 
 		};
 
-		const counters = [ ...this.impostorArgs, ...this.nearArgs ].map( ( a ) => a.counter );
+		const counters = this.allArgs().map( ( a ) => a.counter );
 		this.resetPass = Fn( () => {
 
 			for ( const c of counters ) atomicStore( c, uint( 0 ) );
@@ -303,7 +356,10 @@ export class Trees {
 
 		const gridOrigin = this.gridOrigin, gridN = this.gridN;
 		const nearInstances = this.nearInstances;
+		const meshFadeArgs = this.meshFadeArgs, meshFadeInstances = this.meshFadeInstances;
+		const cardFadeArgs = this.cardFadeArgs, cardFadeInstances = this.cardFadeInstances;
 
+		// Covers the whole crossfade band. Beyond nearTreeRadius the opaque card comes from the impostor pass.
 		this.nearCullPass = Fn( () => {
 
 			const cell = gridOrigin.add( vec2( float( instanceIndex.mod( gridN ) ), float( instanceIndex.div( gridN ) ) ) );
@@ -312,11 +368,24 @@ export class Trees {
 			If( t.z.greaterThan( 0.01 ), () => {
 
 				const base = vec3( t.x, heightAt( t.xy ), t.y ).toVar();
-				const dist = length( camPos.sub( base ) );
+				const dist = length( camPos.sub( base ) ).toVar();
 
-				If( dist.lessThan( nearTreeRadius ).and( inFrustum( base.add( vec3( 0, t.z.mul( 0.5 ), 0 ) ), t.z.mul( 0.6 ) ) ), () => {
+				If( dist.lessThan( crossfadeOut ).and( inFrustum( base.add( vec3( 0, t.z.mul( 0.5 ), 0 ) ), t.z.mul( 0.6 ) ) ), () => {
 
-					append( nearArgs, nearInstances, treeIsBroadleaf( t.w ).greaterThan( 0.5 ), vec4( base, pack( t.z, t.w ) ) );
+					// Shared by sibling branches below, so assign before branching (see append).
+					const isBroad = treeIsBroadleaf( t.w ).greaterThan( 0.5 ).toVar();
+					const rec = vec4( base, pack( t.z, t.w ) ).toVar();
+
+					If( dist.lessThan( nearTreeRadius ), () => {
+
+						append( nearArgs, nearInstances, isBroad, rec );
+						If( dist.greaterThan( crossfadeIn ), () => append( cardFadeArgs, cardFadeInstances, isBroad, rec ) );
+
+					} ).Else( () => {
+
+						append( meshFadeArgs, meshFadeInstances, isBroad, rec );
+
+					} );
 
 				} );
 
@@ -327,10 +396,11 @@ export class Trees {
 	}
 
 	// ----------------------------------------------------------------------------------------- impostor material
-	createImpostorMaterial( species, list ) {
+	// fade: card fading out over the opaque mesh in the inner half of the crossfade band.
+	createImpostorMaterial( species, instances, fade = false ) {
 
 		const mat = new THREE.MeshBasicNodeMaterial();
-		const inst = this.impostorInstances[ list ].toAttribute();
+		const inst = instances.toAttribute();
 		const broad = float( species );
 
 		mat.positionNode = Fn( () => {
@@ -361,7 +431,13 @@ export class Trees {
 			vToCam.assign( viewDir );
 			vFog.assign( fogParams( base.add( vec3( 0, H.mul( 0.5 ), 0 ) ) ) );
 
-			return base.add( right.mul( uv.x.sub( 0.5 ).mul( width ) ) ).add( up.mul( uv.y.mul( H ).sub( H.mul( 0.04 ) ) ) );
+			const p = base.add( right.mul( uv.x.sub( 0.5 ).mul( width ) ) ).add( up.mul( uv.y.mul( H ).sub( H.mul( 0.04 ) ) ) );
+			if ( ! fade ) return p;
+
+			vFade.assign( ss( crossfadeIn, nearTreeRadius, dist ) );
+			// The card's triangles overlap and are coplanar. Pushing each later vertex 1 cm further away makes later
+			// triangles strictly behind earlier ones, so with depth write + a strict test every pixel is blended once.
+			return p.sub( viewDir.mul( float( vertexIndex ).mul( 0.01 ) ) );
 
 		} )();
 
@@ -401,15 +477,24 @@ export class Trees {
 		} )();
 		mat.side = THREE.DoubleSide;
 
+		if ( fade ) {
+
+			mat.opacityNode = vFade;
+			mat.transparent = true;
+			mat.depthFunc = THREE.LessDepth;
+
+		}
+
 		return mat;
 
 	}
 
 	// ----------------------------------------------------------------------------------------- mesh material
-	createMeshMaterial( species ) {
+	// fade: mesh fading in over the opaque card in the outer half of the crossfade band (needs a depth prepass).
+	createMeshMaterial( species, instances, fade = false ) {
 
 		const mat = new THREE.MeshBasicNodeMaterial();
-		const inst = this.nearInstances[ species ].toAttribute();
+		const inst = instances.toAttribute();
 
 		mat.positionNode = Fn( () => {
 
@@ -428,6 +513,7 @@ export class Trees {
 			vLocalY.assign( p.y );
 			const sh = shadowAt( base.xz );
 			vInfo.assign( vec4( float( species ), rnd, sh.r, sh.g ) );
+			if ( fade ) vFade.assign( ss( crossfadeOut, nearTreeRadius, length( cameraPosition.sub( base ) ) ) );
 
 			return base.add( vec3( rx.mul( W ), p.y.mul( H ).sub( 0.3 ), rz.mul( W ) ) );
 
@@ -446,6 +532,15 @@ export class Trees {
 		} )();
 
 		mat.side = THREE.DoubleSide;
+
+		if ( fade ) {
+
+			mat.opacityNode = vFade;
+			mat.transparent = true;
+			mat.depthWrite = false; // the prepass wrote it; LessEqual keeps only the front-most surface
+
+		}
+
 		return mat;
 
 	}
@@ -461,8 +556,8 @@ export class Trees {
 
 		renderer.compute( this.resetPass );
 
-		// near grid
-		const n = Math.ceil( ( 2 * nearTreeRadius.value ) / TREE_CELL ) + 2;
+		// near grid, out to the far edge of the crossfade band
+		const n = Math.ceil( ( 2 * ( nearTreeRadius.value + treeCrossfade.value / 2 ) ) / TREE_CELL ) + 2;
 		this.gridN.value = n;
 		this.gridOrigin.value.set(
 			Math.floor( camera.position.x / TREE_CELL ) - Math.floor( n / 2 ),
@@ -522,9 +617,10 @@ export class Trees {
 			.then( ( buffer ) => {
 
 				const words = new Uint32Array( buffer );
-				const n = [ ...this.impostorArgs, ...this.nearArgs ].map( ( a ) => words[ a.slot * 5 + 1 ] );
+				const n = this.allArgs().map( ( a ) => words[ a.slot * 5 + 1 ] );
 				this.stats.visibleImpostors = n[ 0 ] + n[ 1 ] + n[ 2 ] + n[ 3 ];
 				this.stats.visibleMeshes = n[ 4 ] + n[ 5 ];
+				this.stats.crossfading = n[ 6 ] + n[ 7 ] + n[ 8 ] + n[ 9 ];
 
 			} )
 			.finally( () => this._readPending = false );
